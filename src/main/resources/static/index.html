@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CodesWatch - AI代码安全审计平台</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/style.css?v=20260902a">
+</head>
+<body>
+    <canvas id="matrix-canvas"></canvas>
+    <div class="scan-line"></div>
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fas fa-shield-alt"></i>
+                    <span>CodesWatch</span>
+                </div>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#dashboard" class="nav-item active" data-page="dashboard">
+                    <i class="fas fa-chart-pie"></i>
+                    <span>驾驶舱</span>
+                </a>
+                <a href="#projects" class="nav-item" data-page="projects">
+                    <i class="fas fa-folder-open"></i>
+                    <span>项目管理</span>
+                </a>
+                <a href="#config" class="nav-item" data-page="config">
+                    <i class="fas fa-cog"></i>
+                    <span>大模型配置</span>
+                </a>
+                <a href="#tasks" class="nav-item" data-page="tasks">
+                    <i class="fas fa-tasks"></i>
+                    <span>任务管理</span>
+                </a>
+                <a href="#prompt-config" class="nav-item" data-page="prompt-config">
+                    <i class="fas fa-file-alt"></i>
+                    <span>提示词配置</span>
+                </a>
+            </nav>
+        </aside>
+
+        <main class="main-content">
+            <header class="top-header">
+                <h1 id="page-title">驾驶舱</h1>
+                <div class="header-actions">
+                    <button id="refresh-btn" class="btn btn-secondary">
+                        <i class="fas fa-refresh"></i>
+                        刷新
+                    </button>
+                </div>
+            </header>
+
+            <div id="page-content">
+                <section id="dashboard-section">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon bg-blue">
+                                <i class="fas fa-folder"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">总项目数</p>
+                                <p class="stat-value" id="total-projects">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon bg-green">
+                                <i class="fas fa-check-circle"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">已完成扫描</p>
+                                <p class="stat-value" id="completed-projects">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon bg-orange">
+                                <i class="fas fa-search"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">扫描中</p>
+                                <p class="stat-value" id="scanning-projects">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon bg-red">
+                                <i class="fas fa-exclamation-triangle"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">漏洞总数</p>
+                                <p class="stat-value" id="total-findings">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon bg-critical">
+                                <i class="fas fa-bomb"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">严重漏洞</p>
+                                <p class="stat-value" id="critical-findings">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon bg-high">
+                                <i class="fas fa-fire"></i>
+                            </div>
+                            <div class="stat-content">
+                                <p class="stat-label">高危漏洞</p>
+                                <p class="stat-value" id="high-findings">0</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="recent-projects">
+                        <h2>最近项目</h2>
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>项目名称</th>
+                                        <th>状态</th>
+                                        <th>漏洞数</th>
+                                        <th>创建时间</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="recent-projects-body">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
+
+                <section id="projects-section" class="hidden">
+                    <div class="section-header">
+                        <h2>项目列表</h2>
+                        <button id="create-project-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i>
+                            新建项目
+                        </button>
+                    </div>
+
+                    <div class="search-bar">
+                        <input type="text" id="project-search" placeholder="搜索项目名称...">
+                        <button id="search-btn" class="btn btn-secondary">
+                            <i class="fas fa-search"></i>
+                        </button>
+                    </div>
+
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>项目名称</th>
+                                    <th>描述</th>
+                                    <th>状态</th>
+                                    <th>任务进度</th>
+                                    <th>漏洞数</th>
+                                    <th>创建时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="projects-table-body">
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section id="config-section" class="hidden">
+                    <div class="section-header">
+                        <h2>大模型配置</h2>
+                        <button id="add-llm-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i>
+                            添加配置
+                        </button>
+                    </div>
+
+                    <div class="config-grid" id="config-grid">
+                    </div>
+                </section>
+
+                <section id="tasks-section" class="hidden">
+                    <div class="section-header">
+                        <h2>任务管理</h2>
+                        <div class="header-actions">
+                            <button id="create-task-btn" class="btn btn-primary">
+                                <i class="fas fa-plus"></i>
+                                新建任务
+                            </button>
+                            <div class="filter-tabs">
+                                <button class="filter-tab active" data-filter="all">全部</button>
+                                <button class="filter-tab" data-filter="active">进行中</button>
+                                <button class="filter-tab" data-filter="completed">已完成</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="task-mgmt-row" style="background: rgba(0, 30, 5, 0.9); border-color: rgba(0, 255, 65, 0.5); font-weight: bold; color: #00ff41;">
+                        <div class="task-mgmt-col col-toggle"></div>
+                        <div class="task-mgmt-col col-project">项目</div>
+                        <div class="task-mgmt-col col-name">任务名称</div>
+                        <div class="task-mgmt-col col-type">类型</div>
+                        <div class="task-mgmt-col col-model">模型</div>
+                        <div class="task-mgmt-col col-status">状态</div>
+                        <div class="task-mgmt-col col-progress">进度</div>
+                        <div class="task-mgmt-col col-time">开始时间</div>
+                        <div class="task-mgmt-col col-actions">操作</div>
+                    </div>
+                    <div class="task-tree-container" id="task-management-tree">
+                    </div>
+                </section>
+
+                <section id="prompt-config-section" class="hidden">
+                    <div class="section-header">
+                        <h2>提示词配置</h2>
+                        <button id="add-prompt-config-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i>
+                            新建配置
+                        </button>
+                    </div>
+
+                    <div class="filter-tabs" style="margin-bottom: 20px;">
+                        <button class="filter-tab active" data-phase="ALL">全部阶段</button>
+                        <button class="filter-tab" data-phase="GLOBAL_CONFIG">全局配置</button>
+                        <button class="filter-tab" data-phase="DEPENDENCY_SCAN">依赖扫描</button>
+                        <button class="filter-tab" data-phase="INTERFACE_SCAN">接口扫描</button>
+                        <button class="filter-tab" data-phase="HIGH_RISK_OPERATION_SCAN">高危操作扫描</button>
+                    </div>
+
+                    <div class="prompt-config-grid" id="prompt-config-grid">
+                    </div>
+                </section>
+
+                <section id="project-detail-section" class="hidden">
+                    <div class="section-header">
+                        <button id="back-btn" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i>
+                            返回
+                        </button>
+                        <div class="project-title" id="project-detail-title"></div>
+                    </div>
+
+                    <div class="project-detail-content">
+                        <div class="detail-tabs">
+                            <button class="tab-btn active" data-tab="info">基本信息</button>
+                            <button class="tab-btn" data-tab="tasks">扫描任务</button>
+                            <button class="tab-btn" data-tab="findings">漏洞详情</button>
+                            <button class="tab-btn" data-tab="logs">扫描日志</button>
+                            <button class="tab-btn" data-tab="report">审计报告</button>
+                        </div>
+
+                        <div class="tab-content">
+                            <div id="info-tab" class="tab-pane">
+                                <div class="info-grid">
+                                    <div class="info-item">
+                                        <label>项目名称</label>
+                                        <span id="detail-name"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>项目描述</label>
+                                        <span id="detail-description"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>状态</label>
+                                        <span id="detail-status" class="status-badge"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>创建时间</label>
+                                        <span id="detail-created"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>开始时间</label>
+                                        <span id="detail-started"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>完成时间</label>
+                                        <span id="detail-completed"></span>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>任务进度</label>
+                                        <div class="progress-bar">
+                                            <div id="detail-progress" class="progress-fill"></div>
+                                            <span id="detail-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div class="info-item">
+                                        <label>漏洞数</label>
+                                        <span id="detail-findings"></span>
+                                    </div>
+                                </div>
+                                <div class="info-actions">
+                                    <button id="start-scan-btn" class="btn btn-primary">
+                                        <i class="fas fa-play"></i>
+                                        开始扫描
+                                    </button>
+                                    <button id="cancel-scan-btn" class="btn btn-danger" style="display:none;">
+                                        <i class="fas fa-stop"></i>
+                                        终止扫描
+                                    </button>
+                                    <button id="edit-project-btn" class="btn btn-secondary">
+                                        <i class="fas fa-edit"></i>
+                                        编辑项目
+                                    </button>
+                                    <button id="delete-project-btn" class="btn btn-danger">
+                                        <i class="fas fa-trash"></i>
+                                        删除项目
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div id="tasks-tab" class="tab-pane hidden">
+                                <div id="task-tree"></div>
+                            </div>
+
+                            <div id="findings-tab" class="tab-pane hidden">
+                                <div class="filter-bar">
+                                    <select id="severity-filter">
+                                        <option value="all">全部级别</option>
+                                        <option value="CRITICAL">严重</option>
+                                        <option value="HIGH">高危</option>
+                                        <option value="MEDIUM">中危</option>
+                                        <option value="LOW">低危</option>
+                                        <option value="INFO">信息</option>
+                                    </select>
+                                </div>
+                                <div id="findings-list"></div>
+                            </div>
+
+                            <div id="logs-tab" class="tab-pane hidden">
+                                <div class="logs-container" id="logs-container">
+                                    <div class="logs-header">
+                                        <span>扫描日志</span>
+                                        <button id="clear-logs-btn" class="btn btn-sm btn-secondary">
+                                            清空日志
+                                        </button>
+                                    </div>
+                                    <div class="logs-content" id="logs-content">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="report-tab" class="tab-pane hidden">
+                                <div class="report-content" id="report-content"></div>
+                                <div class="info-actions" style="margin-top: 12px;">
+                                    <button id="export-report-btn" class="btn btn-secondary">
+                                        <i class="fas fa-download"></i>
+                                        导出 Markdown
+                                    </button>
+                                    <button id="export-pdf-btn" class="btn btn-secondary">
+                                        <i class="fas fa-file-pdf"></i>
+                                        导出 PDF
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">新建项目</h3>
+                <button class="modal-close" id="modal-close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <form id="project-form">
+                    <div class="form-group">
+                        <label>项目名称 <span class="required">*</span></label>
+                        <input type="text" id="form-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label>项目描述</label>
+                        <textarea id="form-description" rows="3"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>上传代码包 (ZIP格式)</label>
+                        <input type="file" id="form-file" accept=".zip" class="file-input">
+                        <div id="code-status" class="code-status hidden"></div>
+                        <p class="file-hint">上传ZIP文件将自动解压并读取代码</p>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modal-cancel">取消</button>
+                <button class="btn btn-primary" id="modal-submit">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="llm-modal-overlay" class="modal-overlay hidden">
+        <div class="modal large">
+            <div class="modal-header">
+                <h3 id="llm-modal-title">添加大模型配置</h3>
+                <button class="modal-close" id="llm-modal-close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <form id="llm-form">
+                    <input type="hidden" id="llm-form-id">
+                    <div class="form-group">
+                        <label>配置名称 <span class="required">*</span> <span class="hint">自定义名称，用于区分同一厂商的多个配置</span></label>
+                        <input type="text" id="llm-config-name" placeholder="例如：OpenAI-账号1、Qwen-高并发" required>
+                    </div>
+                    <div class="form-group">
+                        <label>厂商名称 <span class="required">*</span> <span class="hint">可选择预设或输入自定义厂商名</span></label>
+                        <div class="combobox-wrapper">
+                            <input type="text" id="llm-provider" list="llm-provider-list" placeholder="选择或输入厂商名称" required>
+                            <datalist id="llm-provider-list">
+                                <option value="openai">OpenAI</option>
+                                <option value="gemini">Google Gemini</option>
+                                <option value="qwen">阿里云 Qwen</option>
+                                <option value="doubao">火山引擎 Doubao</option>
+                                <option value="zhipu">智谱 AI</option>
+                                <option value="moonshot">月之暗面</option>
+                                <option value="baidu">百度文心一言</option>
+                                <option value="anthropic">Anthropic Claude</option>
+                                <option value="mistral">Mistral AI</option>
+                                <option value="perplexity">Perplexity AI</option>
+                                <option value="groq">Groq</option>
+                                <option value="ollama">Ollama (本地)</option>
+                            </datalist>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>API Base URL <span class="required">*</span></label>
+                        <input type="text" id="llm-base-url" required>
+                    </div>
+                    <div class="form-group">
+                        <label>API Key <span class="required">*</span></label>
+                        <input type="password" id="llm-api-key" required>
+                    </div>
+                    <div class="form-group">
+                        <label>模型名称 <span class="required">*</span></label>
+                        <input type="text" id="llm-model" required>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="llm-thinking">
+                            支持思考模式 <span class="hint">DeepSeek-R1 等推理模型勾选，将启用思考模式请求与思考过程记录</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="llm-enabled">
+                            启用
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="llm-default">
+                            设置为默认
+                        </label>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="llm-modal-cancel">取消</button>
+                <button class="btn btn-primary" id="llm-modal-submit">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="model-select-modal" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>选择扫描模型</h3>
+                <button class="modal-close" id="model-select-close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>选择已启用的大模型 <span class="required">*</span></label>
+                    <select id="model-select-dropdown">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <p class="file-hint">请选择一个已启用的大模型来执行扫描任务</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="model-select-cancel">取消</button>
+                <button class="btn btn-primary" id="model-select-confirm">开始扫描</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="create-task-modal" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>新建扫描任务</h3>
+                <button class="modal-close" id="create-task-close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>选择项目 <span class="required">*</span></label>
+                    <select id="task-project-select">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>选择大模型 <span class="required">*</span></label>
+                    <select id="task-model-select">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <p class="file-hint">选择项目和已启用的模型后启动扫描任务</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="create-task-cancel">取消</button>
+                <button class="btn btn-primary" id="create-task-confirm">启动扫描</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="task-detail-modal" class="modal-overlay hidden">
+        <div class="modal" style="max-width: 800px; max-height: 90vh;">
+            <div class="modal-header">
+                <h3 id="task-detail-title">任务详情</h3>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <button class="modal-close" id="task-detail-fullscreen" title="全屏显示">
+                        <i class="fas fa-expand"></i>
+                    </button>
+                    <button class="modal-close" id="task-detail-close">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="modal-body" style="max-height: 60vh; overflow-y: auto;">
+                <div id="task-detail-info"></div>
+                <div class="detail-tabs" style="margin-top: 20px;">
+                    <button class="tab-btn active" data-tab="thinking">思考过程</button>
+                    <button class="tab-btn" data-tab="chat">对话记录</button>
+                    <button class="tab-btn" data-tab="logs">执行日志</button>
+                </div>
+                <div class="tab-content" style="margin-top: 16px;">
+                    <div id="task-thinking-tab" class="tab-pane">
+                        <div id="task-thinking-display" class="thinking-display">
+                            <p class="waiting-message">暂无思考记录</p>
+                        </div>
+                    </div>
+                    <div id="task-chat-tab" class="tab-pane hidden">
+                        <div id="task-chat-display" class="chat-display">
+                            <p class="waiting-message">暂无对话记录</p>
+                        </div>
+                    </div>
+                    <div id="task-logs-tab" class="tab-pane hidden">
+                        <div id="task-logs-display" class="logs-display">
+                            <p class="waiting-message">暂无执行日志</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="task-detail-back">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="prompt-config-modal" class="modal-overlay hidden">
+        <div class="modal large">
+            <div class="modal-header">
+                <h3 id="prompt-config-modal-title">新建提示词配置</h3>
+                <button class="modal-close" id="prompt-config-close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+                <form id="prompt-config-form">
+                    <input type="hidden" id="prompt-config-id">
+                    <div class="form-group">
+                        <label>配置名称 <span class="required">*</span></label>
+                        <input type="text" id="prompt-config-name" required placeholder="例如：默认依赖扫描配置">
+                    </div>
+                    <div class="form-group">
+                        <label>扫描阶段 <span class="required">*</span></label>
+                        <select id="prompt-config-phase" required>
+                            <option value="GLOBAL_CONFIG">全局配置（所有阶段通用）</option>
+                            <option value="DEPENDENCY_SCAN">依赖扫描</option>
+                            <option value="INTERFACE_SCAN">接口扫描</option>
+                            <option value="HIGH_RISK_OPERATION_SCAN">高危操作扫描</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="display-order-group">
+                        <label>显示顺序</label>
+                        <input type="number" id="prompt-config-order" value="0" min="0" step="1">
+                        <p class="file-hint">数值越小越靠前，用于全局配置的拼接顺序</p>
+                    </div>
+                    <div class="form-group">
+                        <label>系统提示词 (System Prompt)</label>
+                        <textarea id="prompt-config-system" rows="3" placeholder="设置AI角色和行为的系统级提示词..."></textarea>
+                        <p class="file-hint">用于设置AI的角色和整体行为，例如"你是一个专业的代码安全审计专家"</p>
+                    </div>
+                    <div class="form-group" id="analysis-prompt-group">
+                        <label>分析提示词 (Analysis Prompt)</label>
+                        <textarea id="prompt-config-analysis" rows="5" placeholder="用于分析代码的提示词模板..."></textarea>
+                        <p class="file-hint">用于扫描子任务的代码分析，将替换默认的分析提示词模板</p>
+                    </div>
+                    <div class="form-group" id="prefix-prompt-group" style="display:none;">
+                        <label>前缀提示词 (Prefix Prompt)</label>
+                        <textarea id="prompt-config-prefix" rows="5" placeholder="全局配置的前缀提示词，将拼接到分析提示词前面..."></textarea>
+                        <p class="file-hint">全局配置专用，将拼接到所有分析提示词的前面</p>
+                    </div>
+                    <div class="form-group" id="suffix-prompt-group" style="display:none;">
+                        <label>后缀提示词 (Suffix Prompt)</label>
+                        <textarea id="prompt-config-suffix" rows="5" placeholder="全局配置的后缀提示词，将拼接到分析提示词后面..."></textarea>
+                        <p class="file-hint">全局配置专用，将拼接到所有分析提示词的后面</p>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="prompt-config-enabled">
+                            启用此配置
+                        </label>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="prompt-config-cancel">取消</button>
+                <button class="btn btn-primary" id="prompt-config-submit">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js?v=20260902i"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# IDE
+.idea/
+*.iml
+
+# Build
+target/
+
+# Runtime data
+CodeData/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
