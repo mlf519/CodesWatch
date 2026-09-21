@@ -425,7 +425,8 @@ public class TaskService {
             throw new RuntimeException("运行中的任务无法删除，请先取消任务");
         }
         
-        Long projectId = task.getProject().getId();
+        // 项目被删除后任务已解绑（project_id 为空），此处仅用于日志，需容忍为空
+        Long projectId = task.getProject() != null ? task.getProject().getId() : null;
         
         // 收集所有要删除的任务ID（包括自身和所有子任务）
         Set<Long> idsToDelete = new HashSet<>();
