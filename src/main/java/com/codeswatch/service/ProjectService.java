@@ -23,6 +23,7 @@ public class ProjectService {
     private final ScanProjectRepository projectRepository;
     private final ScanTaskRepository taskRepository;
     private final ScanFindingRepository findingRepository;
+    private final TaskService taskService;
 
     @Transactional
     public ScanProjectDTO updateProject(Long id, CreateProjectRequest request) {
@@ -62,7 +63,13 @@ public class ProjectService {
     public void deleteProject(Long id) {
         ScanProject project = projectRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("项目不存在"));
+        // 任务与项目解绑：删除项目不删除任务记录（任务保留在任务管理处，项目列显示"已删除项目"）
+        taskRepository.detachProject(id);
+        // 清空内存关联，避免 JPA 集合级联干扰（无 REMOVE 级联，不会删除任务）
+        project.getTasks().clear();
+        // 删除项目（日志、漏洞级联删除；任务已解绑保留）
         projectRepository.delete(project);
+        log.info("删除项目 {}（{}），已保留其历史任务记录", id, project.getProjectName());
     }
 
     @Transactional(readOnly = true)
@@ -128,7 +135,22 @@ public class ProjectService {
                     .collect(Collectors.toList());
         }
 
-        String projectName = task.getProject() != null ? task.getProject().getProjectName() : null;
+        String projectName = "已删除项目";
+        if (task.getProject() != null) {
+            projectName = task.getProject().getProjectName();
+        }
+
+        // 与任务管理页口径一致：递归统计叶子任务（实际执行扫描的任务），已完成 = COMPLETED 的叶子任务数
+        int totalTaskCount;
+        int completedTaskCount;
+        int[] leafStats = taskService.countLeafStats(task.getId());
+        if (leafStats != null) {
+            totalTaskCount = leafStats[0];
+            completedTaskCount = leafStats[1];
+        } else {
+            totalTaskCount = 1;
+            completedTaskCount = task.getStatus() == ScanTask.TaskStatus.COMPLETED ? 1 : 0;
+        }
 
         return TaskDTO.builder()
                 .id(task.getId())
@@ -138,6 +160,8 @@ public class ProjectService {
                 .status(task.getStatus().name())
                 .thinkingProcess(task.getThinkingProcess())
                 .progress(task.getProgress())
+                .completedTaskCount(completedTaskCount)
+                .totalTaskCount(totalTaskCount)
                 .createdAt(task.getCreatedAt())
                 .startedAt(task.getStartedAt())
                 .completedAt(task.getCompletedAt())
@@ -145,6 +169,7 @@ public class ProjectService {
                 .projectName(projectName)
                 .llmConfigId(task.getLlmConfigId())
                 .llmConfigName(task.getLlmConfigName())
+                .scanRound(task.getScanRound())
                 .build();
     }
 
@@ -162,6 +187,7 @@ public class ProjectService {
                 .suggestion(finding.getSuggestion())
                 .verified(finding.getVerified())
                 .createdAt(finding.getCreatedAt())
+                .scanRound(finding.getTask() != null ? finding.getTask().getScanRound() : null)
                 .build();
     }
 }

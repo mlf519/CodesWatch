@@ -51,11 +51,14 @@ public class ProjectController {
 
     /**
      * 获取项目审计报告内容（Markdown），避免在详情 DTO 中传输大字段
+     * scanRound 为空时统计全部批次，否则仅统计指定扫描任务批次
      */
     @GetMapping("/{id}/report")
-    public ResponseEntity<Map<String, String>> getProjectReport(@PathVariable Long id) {
+    public ResponseEntity<Map<String, String>> getProjectReport(
+            @PathVariable Long id,
+            @RequestParam(required = false) Integer scanRound) {
         // 报告尚未生成时现场生成（支持已结束项目预览）
-        String content = scanEngineService.getOrGenerateReport(id);
+        String content = scanEngineService.getOrGenerateReport(id, scanRound);
         return ResponseEntity.ok(Map.of("reportContent", content));
     }
 
@@ -65,8 +68,9 @@ public class ProjectController {
     @GetMapping("/{id}/report/export")
     public ResponseEntity<byte[]> exportReport(
             @PathVariable Long id,
+            @RequestParam(required = false) Integer scanRound,
             @RequestParam(defaultValue = "md") String format) {
-        String content = scanEngineService.getOrGenerateReport(id);
+        String content = scanEngineService.getOrGenerateReport(id, scanRound);
         ScanProject project = projectRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("项目不存在"));
         String fileName = project.getProjectName() + "_审计报告";

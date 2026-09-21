@@ -25,4 +25,6 @@ public class FindingDTO {
     private String suggestion;
     private Boolean verified;
     private LocalDateTime createdAt;
+    /** 所属扫描批次号（同一项目多次扫描时用于区分批次） */
+    private Integer scanRound;
 }

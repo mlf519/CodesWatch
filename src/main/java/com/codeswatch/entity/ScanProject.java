@@ -71,7 +71,13 @@ public class ScanProject {
     @Column(name = "last_llm_config_id")
     private Long lastLlmConfigId;
 
-    @OneToMany(mappedBy = "project", cascade = {CascadeType.PERSIST, CascadeType.MERGE, CascadeType.REMOVE}, orphanRemoval = true)
+    /** 扫描次数（每发起一次扫描 +1，用于区分多次扫描的任务批次） */
+    @Column(name = "scan_count", nullable = false)
+    @Builder.Default
+    private Integer scanCount = 0;
+
+    // 任务与项目解绑：删除项目不同步删除任务，因此此处不含 REMOVE 级联与 orphanRemoval
+    @OneToMany(mappedBy = "project", cascade = {CascadeType.PERSIST, CascadeType.MERGE})
     @Builder.Default
     private List<ScanTask> tasks = new ArrayList<>();
 

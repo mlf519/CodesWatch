@@ -37,6 +37,8 @@ public class TaskDTO {
     private String projectName;
     private Long llmConfigId;
     private String llmConfigName;
+    /** 扫描批次号（同一项目多次扫描时用于区分批次） */
+    private Integer scanRound;
     private List<LogEntryDTO> logs;
     private List<ConversationEntryDTO> conversationHistory;
 }

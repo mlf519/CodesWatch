@@ -82,8 +82,8 @@ public class ScanEngineService {
                 taskRepository.updateStatusByProjectIdAndStatusIn(project.getId(),
                         ScanTask.TaskStatus.CANCELLED, LocalDateTime.now(),
                         List.of(ScanTask.TaskStatus.PENDING));
-                // 修正容器任务状态：孙任务已全部完成但容器仍卡在等待/运行
-                aggregateInterfaceSubTasks(project.getId());
+                // 修正容器任务状态：孙任务已全部完成但容器仍卡在等待/运行（汇总所有批次）
+                aggregateInterfaceSubTasks(project.getId(), null);
             }
             if (!scanningProjects.isEmpty()) {
                 projectRepository.saveAll(scanningProjects);
@@ -224,22 +224,10 @@ public class ScanEngineService {
         ScanProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new RuntimeException("项目不存在"));
 
-        // 检查是否需要清除历史数据（选择相同大模型且之前已完成扫描时）
-        boolean needClearHistory = project.getLastLlmConfigId() != null
-                && project.getLastLlmConfigId().equals(llmConfigId)
-                && project.getStatus() == ScanProject.ProjectStatus.COMPLETED;
-
-        if (needClearHistory) {
-            log.info("检测到选择相同大模型({})，清除项目{}的历史扫描数据", llmConfigId, projectId);
-            clearProjectScanData(projectId);
-            project = projectRepository.findById(projectId).orElseThrow();
-        }
-
-        if (project.getStatus() != ScanProject.ProjectStatus.PENDING
-                && project.getStatus() != ScanProject.ProjectStatus.PAUSED
-                && project.getStatus() != ScanProject.ProjectStatus.FAILED
-                && project.getStatus() != ScanProject.ProjectStatus.CANCELLED) {
-            throw new RuntimeException("项目已在扫描中或已完成");
+        // 仅当项目正在扫描时禁止再次发起；已完成/失败/暂停/取消的项目均可再次扫描，
+        // 每次扫描创建独立的新批次任务（不覆盖历史任务）
+        if (project.getStatus() == ScanProject.ProjectStatus.SCANNING) {
+            throw new RuntimeException("项目正在扫描中，请等待当前扫描完成");
         }
 
         String projectCode = getProjectCode(project);
@@ -250,32 +238,40 @@ public class ScanEngineService {
         if (project.getScanSessionId() == null) {
             project.setScanSessionId(UUID.randomUUID().toString());
         }
+        // 批次号：已有历史任务但无批次记录的项目，历史视为任务1，本次从任务2开始命名
+        int scanRound;
+        if (project.getScanCount() == null || project.getScanCount() == 0) {
+            boolean hasExistingTasks = !taskRepository.findByProjectId(projectId).isEmpty();
+            scanRound = hasExistingTasks ? 2 : 1;
+        } else {
+            scanRound = project.getScanCount() + 1;
+        }
+        project.setScanCount(scanRound);
         project.setLastLlmConfigId(llmConfigId);
         project.setStatus(ScanProject.ProjectStatus.SCANNING);
         project.setStartedAt(LocalDateTime.now());
-        project.setTotalTasks(0);
-        project.setCompletedTasks(0);
-        project.setFindingCount(0);
         project.setReportContent(null);
-        project.getTasks().clear();
-        project.getLogs().clear();
-        project.getFindings().clear();
+        // 不清空历史任务/日志/漏洞：多次扫描的任务信息各自独立保留
         project = projectRepository.saveAndFlush(project);
 
         taskService.registerTask(projectId, emitter);
 
-        saveLog(project, null, ScanLog.LogType.TASK_START, "开始扫描项目: " + project.getProjectName());
+        saveLog(project, null, ScanLog.LogType.TASK_START,
+                String.format("开始扫描项目（任务%d）: %s", scanRound, project.getProjectName()));
 
         String codeForScan = projectCode;
         Long scanProjectId = project.getId();
+        final Integer scanRoundFinal = scanRound;
 
         CompletableFuture<Void> scanFuture = CompletableFuture.runAsync(() -> {
+            Object execToken = taskService.beginExecution(scanProjectId);
             try {
-                executeScanPhases(scanProjectId, emitter, llmConfigId, codeForScan);
+                executeScanPhases(scanProjectId, emitter, llmConfigId, codeForScan, scanRoundFinal);
             } catch (Exception e) {
                 log.error("扫描执行失败", e);
                 handleScanFailure(scanProjectId, e);
             } finally {
+                taskService.endExecution(execToken);
                 taskService.unregisterTask(scanProjectId);
             }
         }, scanExecutor);
@@ -328,11 +324,13 @@ public class ScanEngineService {
         try {
             ScanProject project = projectRepository.findById(projectId).orElse(null);
             if (project != null) {
-                if (e.getMessage() != null && e.getMessage().contains("任务已取消")) {
-                    project.setStatus(ScanProject.ProjectStatus.CANCELLED);
-                } else {
-                    project.setStatus(ScanProject.ProjectStatus.FAILED);
-                }
+                // 任务已取消（用户取消/项目终止）：项目保持 CANCELLED，避免被其它异常覆盖为 FAILED
+                boolean cancelled = taskService.isCancelled(projectId)
+                        || project.getStatus() == ScanProject.ProjectStatus.CANCELLED
+                        || (e.getMessage() != null && e.getMessage().contains("任务已取消"));
+                project.setStatus(cancelled
+                        ? ScanProject.ProjectStatus.CANCELLED
+                        : ScanProject.ProjectStatus.FAILED);
                 project.setCompletedAt(LocalDateTime.now());
                 projectRepository.saveAndFlush(project);
             }
@@ -362,7 +360,7 @@ public class ScanEngineService {
         }
     }
 
-    private void executeScanPhases(Long projectId, SseEmitter emitter, Long llmConfigId, String projectCode) {
+    private void executeScanPhases(Long projectId, SseEmitter emitter, Long llmConfigId, String projectCode, Integer scanRound) {
         try {
             taskService.checkPauseCancel(projectId);
             boolean hasFailure = false;
@@ -382,7 +380,7 @@ public class ScanEngineService {
             } else {
                 ScanTask dependencyTask = self.createPhaseTask(projectId, "依赖扫描",
                         "扫描项目的所有依赖是否存在安全漏洞",
-                        ScanTask.TaskType.DEPENDENCY_SCAN, llmConfigId, llmConfigName);
+                        ScanTask.TaskType.DEPENDENCY_SCAN, llmConfigId, llmConfigName, scanRound);
 
                 List<String> pomFiles = findPomFiles(projectCode);
                 if (!pomFiles.isEmpty()) {
@@ -408,7 +406,7 @@ public class ScanEngineService {
             } else {
                 ScanTask interfaceTask = self.createPhaseTask(projectId, "接口扫描",
                         "扫描所有互联网入口，识别代码中是否存在安全漏洞",
-                        ScanTask.TaskType.INTERFACE_SCAN, llmConfigId, llmConfigName);
+                        ScanTask.TaskType.INTERFACE_SCAN, llmConfigId, llmConfigName, scanRound);
 
                 log.info("开始接口扫描，项目代码长度: {} 字符", projectCode.length());
                 saveLog(projectId, null, ScanLog.LogType.INFO, "开始接口扫描...");
@@ -448,7 +446,7 @@ public class ScanEngineService {
             } else {
                 ScanTask highRiskTask = self.createPhaseTask(projectId, "高危操作扫描",
                         "扫描代码中的高危操作方法，分析是否能从互联网接口进行利用",
-                        ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN, llmConfigId, llmConfigName);
+                        ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN, llmConfigId, llmConfigName, scanRound);
 
                 // 按启用的高危扫描配置创建子任务和孙任务
                 self.createHighRiskSubTasksByConfig(highRiskTask, projectCode);
@@ -467,12 +465,16 @@ public class ScanEngineService {
             }
 
             // ==================== 阶段二：执行所有任务 ====================
-            hasFailure = executeAllTasks(projectId, emitter, llmConfigId, projectCode);
+            hasFailure = executeAllTasks(projectId, emitter, llmConfigId, projectCode, scanRound);
 
             project = projectRepository.findById(projectId).orElseThrow();
             // 扫描已被终止：保持 CANCELLED 状态，不再覆盖为完成/失败
             if (project.getStatus() == ScanProject.ProjectStatus.CANCELLED
                     || taskService.isCancelled(projectId)) {
+                // 取消请求可能因项目行被本事务占用而未能同步更新，这里由扫描线程兜底置为取消
+                project.setStatus(ScanProject.ProjectStatus.CANCELLED);
+                project.setCompletedAt(LocalDateTime.now());
+                projectRepository.saveAndFlush(project);
                 saveLog(project, null, ScanLog.LogType.WARNING, "扫描已终止，项目保持取消状态");
                 emitter.send(SseEmitter.event().name("complete").data("扫描已终止"));
                 emitter.complete();
@@ -489,7 +491,7 @@ public class ScanEngineService {
             project.setFindingCount(Math.toIntExact(findingRepository.countByProjectId(projectId)));
             projectRepository.saveAndFlush(project);
 
-            String report = generateReport(project);
+            String report = generateReport(project, scanRound);
             project.setReportContent(report);
             projectRepository.saveAndFlush(project);
 
@@ -522,19 +524,26 @@ public class ScanEngineService {
 
     @Transactional
     public ScanTask createPhaseTask(Long projectId, String name, String description,
-                                     ScanTask.TaskType type, Long llmConfigId, String llmConfigName) {
+                                     ScanTask.TaskType type, Long llmConfigId, String llmConfigName,
+                                     Integer scanRound) {
         ScanProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new RuntimeException("项目不存在"));
 
+        // 批次命名区分：同一项目多次扫描时，任务名带上“任务N”后缀（任务2/3 等）
+        String batchName = (scanRound != null && scanRound > 1)
+                ? String.format("%s · 任务%d", name, scanRound)
+                : name;
+
         ScanTask task = ScanTask.builder()
                 .project(project)
-                .taskName(name)
+                .taskName(batchName)
                 .taskDescription(description)
                 .taskType(type)
                 .status(ScanTask.TaskStatus.PENDING)
                 .progress(0)
                 .llmConfigId(llmConfigId)
                 .llmConfigName(llmConfigName)
+                .scanRound(scanRound)
                 .build();
 
         task = taskRepository.saveAndFlush(task);
@@ -572,6 +581,7 @@ public class ScanEngineService {
                 .progress(0)
                 .llmConfigId(parentTask.getLlmConfigId())
                 .llmConfigName(parentTask.getLlmConfigName())
+                .scanRound(parentTask.getScanRound())
                 .build();
 
         subTask = taskRepository.saveAndFlush(subTask);
@@ -602,7 +612,8 @@ public class ScanEngineService {
                 displayFilePath, projectCode != null ? projectCode.length() : 0);
 
         try {
-            taskService.checkPauseCancel(projectId);
+            // 注意：暂停/取消的等待已在 executeSingleTask 中事务提交后执行，
+            // 这里不再检查，避免在持有任务行锁时长时间等待导致暂停/取消/继续操作被锁阻塞
 
             // 统一根据filePath动态提取文件内容
             String targetCode;
@@ -799,6 +810,16 @@ public class ScanEngineService {
                 tryExtractAndLogThinking(project, subTask, analysisResult);
             }
             
+            // 任务已被取消：由本执行线程自行置为 CANCELLED，避免覆盖为 COMPLETED
+            // （取消请求不会等待本任务持有的行锁，因此需要在此处收尾）
+            if (taskService.isCancelled(projectId)) {
+                subTask.setStatus(ScanTask.TaskStatus.CANCELLED);
+                subTask.setCompletedAt(LocalDateTime.now());
+                subTask.setProgress(100);
+                taskRepository.saveAndFlush(subTask);
+                return;
+            }
+
             subTask.setProgress(70);
             taskRepository.saveAndFlush(subTask);
 
@@ -822,7 +843,8 @@ public class ScanEngineService {
             String errorMsg = e.getMessage();
             if (errorMsg == null) errorMsg = e.getClass().getSimpleName();
 
-            if (errorMsg.contains("任务已取消")) {
+            // 任务已被取消（用户取消/项目终止）：保持 CANCELLED，避免被其它异常（如LLM超时）覆盖为 FAILED
+            if (errorMsg.contains("任务已取消") || taskService.isCancelled(projectId)) {
                 subTask.setStatus(ScanTask.TaskStatus.CANCELLED);
             } else {
                 subTask.setStatus(ScanTask.TaskStatus.FAILED);
@@ -1119,6 +1141,11 @@ public class ScanEngineService {
         while (iteration < maxIterations) {
             iteration++;
 
+            // 用户已取消任务：立即中断后续轮次，不再消耗大模型调用
+            if (taskService.isCancelled(projectId)) {
+                throw new RuntimeException("任务已取消");
+            }
+
             // 先检查是否包含more标签 - 支持多文件格式: more:file1;file2:more
             Pattern morePattern = Pattern.compile("more:(.*?):more", Pattern.DOTALL);
             Matcher moreMatcher = morePattern.matcher(response);
@@ -1264,8 +1291,8 @@ public class ScanEngineService {
                     
                     long startTime = System.currentTimeMillis();
                     try {
-                        // 使用带思考模式的多轮对话方法
-                        LlmResponse llmResponse = llmService.multiTurnChatWithThinking(messages, llmConfigId, 120000);
+                        // 使用带思考模式的多轮对话方法（等待大模型回复时间延长为原来的 3 倍）
+                        LlmResponse llmResponse = llmService.multiTurnChatWithThinking(messages, llmConfigId, 360000);
                         long duration = System.currentTimeMillis() - startTime;
                         
                         String newResponse = llmResponse.getContent();
@@ -1385,10 +1412,10 @@ public class ScanEngineService {
                     saveLog(project, task, ScanLog.LogType.LLM_REQUEST,
                             "大模型请求" + roundNum + "\n" + roundJson);
                     
-                    // 进行下一轮对话
+                    // 进行下一轮对话（等待大模型回复时间延长为原来的 3 倍）
                     try {
                         long startTime = System.currentTimeMillis();
-                        LlmResponse llmResponse = llmService.multiTurnChatWithThinking(messages, llmConfigId, 120000);
+                        LlmResponse llmResponse = llmService.multiTurnChatWithThinking(messages, llmConfigId, 360000);
                         long duration = System.currentTimeMillis() - startTime;
                         String newResponse = llmResponse.getContent();
                         
@@ -1819,6 +1846,7 @@ public class ScanEngineService {
                     .llmConfigId(interfaceSubTask.getLlmConfigId())
                     .llmConfigName(interfaceSubTask.getLlmConfigName())
                     .promptConfigId(config.getId())
+                    .scanRound(interfaceSubTask.getScanRound())
                     .build();
             tasksToSave.add(vulnSubTask);
             taskNames.add(config.getName());
@@ -1897,6 +1925,7 @@ public class ScanEngineService {
                     .llmConfigId(highRiskTask.getLlmConfigId())
                     .llmConfigName(highRiskTask.getLlmConfigName())
                     .promptConfigId(config.getId())
+                    .scanRound(highRiskTask.getScanRound())
                     .build();
             taskRepository.save(configSubTask);
 
@@ -1944,6 +1973,7 @@ public class ScanEngineService {
                         .llmConfigId(highRiskTask.getLlmConfigId())
                         .llmConfigName(highRiskTask.getLlmConfigName())
                         .promptConfigId(config.getId())
+                        .scanRound(highRiskTask.getScanRound())
                         .build();
                 grandchildTasks.add(grandchildTask);
             }
@@ -2031,6 +2061,7 @@ public class ScanEngineService {
                     .progress(0)
                     .llmConfigId(highRiskTask.getLlmConfigId())
                     .llmConfigName(highRiskTask.getLlmConfigName())
+                    .scanRound(highRiskTask.getScanRound())
                     .build();
             tasksToSave.add(subTask);
         }
@@ -2049,13 +2080,13 @@ public class ScanEngineService {
      * 执行所有PENDING状态的任务
      * @return true 如果有任何阶段失败，false 如果所有阶段都成功
      */
-    private boolean executeAllTasks(Long projectId, SseEmitter emitter, Long llmConfigId, String projectCode) {
+    private boolean executeAllTasks(Long projectId, SseEmitter emitter, Long llmConfigId, String projectCode, Integer scanRound) {
         ScanProject project = projectRepository.findById(projectId).orElseThrow();
 
-        // 更新阶段任务状态为RUNNING
-        updatePhaseTaskStatus(projectId, "依赖扫描", ScanTask.TaskStatus.RUNNING);
-        updatePhaseTaskStatus(projectId, "接口扫描", ScanTask.TaskStatus.RUNNING);
-        updatePhaseTaskStatus(projectId, "高危操作扫描", ScanTask.TaskStatus.RUNNING);
+        // 更新阶段任务状态为RUNNING（仅当前批次）
+        updatePhaseTaskStatus(projectId, ScanTask.TaskType.DEPENDENCY_SCAN, ScanTask.TaskStatus.RUNNING, scanRound);
+        updatePhaseTaskStatus(projectId, ScanTask.TaskType.INTERFACE_SCAN, ScanTask.TaskStatus.RUNNING, scanRound);
+        updatePhaseTaskStatus(projectId, ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN, ScanTask.TaskStatus.RUNNING, scanRound);
 
         boolean dependencyFailed = false;
         boolean interfaceFailed = false;
@@ -2066,49 +2097,55 @@ public class ScanEngineService {
         try {
             // 1. 执行依赖子任务
             self.executeTasksByType(projectId, emitter, llmConfigId, projectCode,
-                    List.of(ScanTask.TaskType.SUB_DEPENDENCY_SCAN));
+                    List.of(ScanTask.TaskType.SUB_DEPENDENCY_SCAN), scanRound);
             // 检查依赖子任务是否有失败
-            dependencyFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_DEPENDENCY_SCAN);
-            updatePhaseTaskStatus(projectId, "依赖扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            dependencyFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_DEPENDENCY_SCAN, scanRound);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.DEPENDENCY_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         } catch (Exception e) {
             log.warn("依赖子任务执行异常: {}", e.getMessage());
             dependencyFailed = true;
-            updatePhaseTaskStatus(projectId, "依赖扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.DEPENDENCY_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         }
 
         try {
             // 2. 直接执行漏洞孙任务（接口子任务下的漏洞类型任务）
             // 接口子任务不执行 LLM，而是作为容器，随孙任务完成实时汇总状态
             self.executeTasksByType(projectId, emitter, llmConfigId, projectCode,
-                    List.of(ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN));
+                    List.of(ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN), scanRound);
 
             // 最终兜底：汇总接口子任务的执行结果
-            aggregateInterfaceSubTasks(projectId);
+            aggregateInterfaceSubTasks(projectId, scanRound);
             // 检查漏洞孙任务是否有失败
-            interfaceFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN);
-            updatePhaseTaskStatus(projectId, "接口扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            interfaceFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN, scanRound);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.INTERFACE_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         } catch (Exception e) {
             log.warn("漏洞孙任务执行异常: {}", e.getMessage());
             interfaceFailed = true;
-            updatePhaseTaskStatus(projectId, "接口扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.INTERFACE_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         }
 
         try {
             // 3. 执行高危扫描孙任务
-            self.executeHighRiskGrandchildTasks(projectId, emitter, llmConfigId, projectCode);
+            self.executeHighRiskGrandchildTasks(projectId, emitter, llmConfigId, projectCode, scanRound);
             // 检查高危扫描孙任务是否有失败
-            highRiskFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_HIGH_RISK_SCAN);
-            updatePhaseTaskStatus(projectId, "高危操作扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            highRiskFailed = checkPhaseHasFailures(projectId, ScanTask.TaskType.SUB_HIGH_RISK_SCAN, scanRound);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         } catch (Exception e) {
             log.warn("高危扫描孙任务执行异常: {}", e.getMessage());
             highRiskFailed = true;
-            updatePhaseTaskStatus(projectId, "高危操作扫描",
-                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+            updatePhaseTaskStatus(projectId, ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN,
+                    taskService.isCancelled(projectId) ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED,
+                    scanRound);
         }
 
         try {
@@ -2125,8 +2162,8 @@ public class ScanEngineService {
     /**
      * 检查指定阶段的任务是否有失败
      */
-    private boolean checkPhaseHasFailures(Long projectId, ScanTask.TaskType taskType) {
-        List<ScanTask> tasks = taskRepository.findByProjectIdAndTaskType(projectId, taskType);
+    private boolean checkPhaseHasFailures(Long projectId, ScanTask.TaskType taskType, Integer scanRound) {
+        List<ScanTask> tasks = taskRepository.findByProjectIdAndTaskTypeAndScanRound(projectId, taskType, scanRound);
         return tasks.stream().anyMatch(t -> t.getStatus() == ScanTask.TaskStatus.FAILED);
     }
     
@@ -2137,10 +2174,10 @@ public class ScanEngineService {
      * 3. 孙任务完成后，将父任务（配置级）标记为完成
      */
     public void executeHighRiskGrandchildTasks(Long projectId, SseEmitter emitter, 
-                                                 Long llmConfigId, String projectCode) {
+                                                 Long llmConfigId, String projectCode, Integer scanRound) {
         // 获取所有高危扫描任务
-        List<ScanTask> allHighRiskTasks = taskRepository.findByProjectIdAndTaskTypeIn(projectId,
-                List.of(ScanTask.TaskType.SUB_HIGH_RISK_SCAN));
+        List<ScanTask> allHighRiskTasks = taskRepository.findByProjectIdAndTaskTypeInAndScanRound(projectId,
+                List.of(ScanTask.TaskType.SUB_HIGH_RISK_SCAN), scanRound);
         
         // 找出叶子任务（没有子任务的孙任务）
         List<ScanTask> leafTasks = new ArrayList<>();
@@ -2196,9 +2233,12 @@ public class ScanEngineService {
      * 汇总接口子任务状态
      * 当所有漏洞孙任务完成后，汇总接口子任务的执行状态和结果
      */
-    public void aggregateInterfaceSubTasks(Long projectId) {
-        List<ScanTask> interfaceSubTasks = taskRepository.findByProjectIdAndTaskType(
-                projectId, ScanTask.TaskType.SUB_INTERFACE_SCAN);
+    public void aggregateInterfaceSubTasks(Long projectId, Integer scanRound) {
+        // scanRound 为 null 时汇总该项目所有批次（用于启动恢复等场景）
+        List<ScanTask> interfaceSubTasks = (scanRound == null)
+                ? taskRepository.findByProjectIdAndTaskType(projectId, ScanTask.TaskType.SUB_INTERFACE_SCAN)
+                : taskRepository.findByProjectIdAndTaskTypeAndScanRound(
+                        projectId, ScanTask.TaskType.SUB_INTERFACE_SCAN, scanRound);
         
         if (interfaceSubTasks.isEmpty()) {
             log.info("没有接口子任务需要汇总");
@@ -2321,11 +2361,19 @@ public class ScanEngineService {
                                    Long llmConfigId, String projectCode) {
         try {
             taskService.checkPauseCancel(projectId);
-            executeSubTaskWithProtocol(projectId, task, emitter, llmConfigId, projectCode);
+            // 标记为执行中：本事务从 executeSubTaskWithProtocol 起持有任务行锁，
+            // 取消/暂停等操作需跳过该行，避免等待行锁
+            taskService.markExecuting(projectId, task.getId());
+            try {
+                executeSubTaskWithProtocol(projectId, task, emitter, llmConfigId, projectCode);
+            } finally {
+                taskService.unmarkExecuting(projectId, task.getId());
+            }
         } catch (Exception e) {
             log.warn("执行任务失败: {} - {}", task.getTaskName(), e.getMessage());
-            // 因终止导致的异常：任务保持/置为 CANCELLED，不算失败
-            boolean cancelled = e.getMessage() != null && e.getMessage().contains("任务已取消");
+            // 任务已取消（用户取消/项目终止）：保持 CANCELLED，避免被其它异常（如LLM超时）覆盖为 FAILED
+            boolean cancelled = taskService.isCancelled(projectId)
+                    || (e.getMessage() != null && e.getMessage().contains("任务已取消"));
             task.setStatus(cancelled ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.FAILED);
             task.setCompletedAt(LocalDateTime.now());
             if (!cancelled) {
@@ -2344,8 +2392,9 @@ public class ScanEngineService {
      * 每个任务通过 executeSingleTask 在独立事务中执行
      */
     public void executeTasksByType(Long projectId, SseEmitter emitter, Long llmConfigId, 
-                                     String projectCode, List<ScanTask.TaskType> taskTypes) {
-        List<ScanTask> tasks = taskRepository.findByProjectIdAndStatusIn(projectId, List.of(ScanTask.TaskStatus.PENDING))
+                                     String projectCode, List<ScanTask.TaskType> taskTypes, Integer scanRound) {
+        List<ScanTask> tasks = taskRepository.findByProjectIdAndStatusInAndScanRound(
+                projectId, List.of(ScanTask.TaskStatus.PENDING), scanRound)
                 .stream()
                 .filter(t -> taskTypes.contains(t.getTaskType()))
                 .toList();
@@ -2397,8 +2446,8 @@ public class ScanEngineService {
     /**
      * 更新阶段任务状态
      */
-    private void updatePhaseTaskStatus(Long projectId, String taskName, ScanTask.TaskStatus status) {
-        List<ScanTask> tasks = taskRepository.findByProjectIdAndTaskName(projectId, taskName);
+    private void updatePhaseTaskStatus(Long projectId, ScanTask.TaskType taskType, ScanTask.TaskStatus status, Integer scanRound) {
+        List<ScanTask> tasks = taskRepository.findByProjectIdAndTaskTypeAndScanRound(projectId, taskType, scanRound);
         for (ScanTask task : tasks) {
             task.setStatus(status);
             if (status == ScanTask.TaskStatus.RUNNING) {
@@ -3089,38 +3138,63 @@ public class ScanEngineService {
 
     private void parseFindings(ScanProject project, ScanTask task, String analysisResult) {
         try {
+            // 兼容 JSON 协议：若结论为 {"findings":[...]} 结构则按 JSON 解析
             String cleanResult = extractJsonForParse(analysisResult);
-            JsonNode root = objectMapper.readTree(cleanResult);
+            if (cleanResult != null && cleanResult.startsWith("{")) {
+                JsonNode root = objectMapper.readTree(cleanResult);
+                if (root.has("findings") && root.get("findings").isArray() && root.get("findings").size() > 0) {
+                    for (JsonNode findingNode : root.get("findings")) {
+                        ScanFinding.FindingSeverity severity = ScanFinding.FindingSeverity.valueOf(
+                                findingNode.has("severity") ? findingNode.get("severity").asText().toUpperCase() : "MEDIUM");
 
-            if (root.has("findings")) {
-                JsonNode findingsNode = root.get("findings");
+                        ScanFinding.FindingType findingType = ScanFinding.FindingType.valueOf(
+                                findingNode.has("findingType") ? findingNode.get("findingType").asText().toUpperCase() : "INFORMATION_DISCLOSURE");
 
-                for (JsonNode findingNode : findingsNode) {
-                    ScanFinding.FindingSeverity severity = ScanFinding.FindingSeverity.valueOf(
-                            findingNode.has("severity") ? findingNode.get("severity").asText().toUpperCase() : "MEDIUM");
+                        ScanFinding finding = ScanFinding.builder()
+                                .project(project)
+                                .task(task)
+                                .title(findingNode.has("title") ? findingNode.get("title").asText() : "未命名漏洞")
+                                .description(findingNode.has("description") ? findingNode.get("description").asText() : "")
+                                .codeSnippet(findingNode.has("codeSnippet") ? findingNode.get("codeSnippet").asText() : "")
+                                .filePath(findingNode.has("filePath") ? findingNode.get("filePath").asText() : "")
+                                .lineNumber(findingNode.has("lineNumber") ? findingNode.get("lineNumber").asText() : "")
+                                .severity(severity)
+                                .findingType(findingType)
+                                .exploitationPath(findingNode.has("exploitationPath") ? findingNode.get("exploitationPath").asText() : "")
+                                .suggestion(findingNode.has("suggestion") ? findingNode.get("suggestion").asText() : "")
+                                .verified(false)
+                                .build();
 
-                    ScanFinding.FindingType findingType = ScanFinding.FindingType.valueOf(
-                            findingNode.has("findingType") ? findingNode.get("findingType").asText().toUpperCase() : "INFORMATION_DISCLOSURE");
+                        findingRepository.save(finding);
 
+                        saveLog(project, task, ScanLog.LogType.FINDING,
+                                "发现漏洞 [" + severity + "]: " + finding.getTitle());
+                    }
+                    return;
+                }
+            }
+
+            // 文本结论协议（end:Vul!...:end / end:Safe!...:end）：
+            // 任务判定存在漏洞时，将大模型文本结论落库为漏洞发现（防止任务重启重复落库）
+            if ("VULNERABILITY_FOUND".equals(task.getResult())) {
+                String summary = task.getAnalysisResult();
+                if (summary == null || summary.isBlank()) {
+                    summary = analysisResult;
+                }
+                if (summary != null && !summary.isBlank()
+                        && findingRepository.findByTaskId(task.getId()).isEmpty()) {
                     ScanFinding finding = ScanFinding.builder()
                             .project(project)
                             .task(task)
-                            .title(findingNode.has("title") ? findingNode.get("title").asText() : "未命名漏洞")
-                            .description(findingNode.has("description") ? findingNode.get("description").asText() : "")
-                            .codeSnippet(findingNode.has("codeSnippet") ? findingNode.get("codeSnippet").asText() : "")
-                            .filePath(findingNode.has("filePath") ? findingNode.get("filePath").asText() : "")
-                            .lineNumber(findingNode.has("lineNumber") ? findingNode.get("lineNumber").asText() : "")
-                            .severity(severity)
-                            .findingType(findingType)
-                            .exploitationPath(findingNode.has("exploitationPath") ? findingNode.get("exploitationPath").asText() : "")
-                            .suggestion(findingNode.has("suggestion") ? findingNode.get("suggestion").asText() : "")
+                            .title(buildFindingTitle(task, summary))
+                            .description(summary.trim())
+                            .severity(detectSeverity(summary))
+                            .findingType(detectFindingType(task))
                             .verified(false)
                             .build();
-
                     findingRepository.save(finding);
-
                     saveLog(project, task, ScanLog.LogType.FINDING,
-                            "发现漏洞 [" + severity + "]: " + finding.getTitle());
+                            "发现漏洞 [" + finding.getSeverity() + "]: " + finding.getTitle());
                 }
             }
         } catch (Exception e) {
@@ -3130,8 +3204,61 @@ public class ScanEngineService {
         }
     }
 
-    private String generateReport(ScanProject project) {
+    /** 漏洞标题：优先取结论文本首行（截断），为空时回退任务名 */
+    private String buildFindingTitle(ScanTask task, String summary) {
+        String title = summary.trim().split("\n")[0].trim();
+        if (title.length() > 80) {
+            title = title.substring(0, 80) + "...";
+        }
+        return title.isEmpty() ? task.getTaskName() : title;
+    }
+
+    /** 从结论文本推断漏洞等级，未命中关键词默认高危 */
+    private ScanFinding.FindingSeverity detectSeverity(String summary) {
+        String s = summary.toLowerCase();
+        if (s.contains("严重") || s.contains("critical")) return ScanFinding.FindingSeverity.CRITICAL;
+        if (s.contains("中危") || s.contains("medium")) return ScanFinding.FindingSeverity.MEDIUM;
+        if (s.contains("低危") || s.contains("low")) return ScanFinding.FindingSeverity.LOW;
+        return ScanFinding.FindingSeverity.HIGH;
+    }
+
+    /** 从任务名称/描述推断漏洞类型 */
+    private ScanFinding.FindingType detectFindingType(ScanTask task) {
+        String s = ((task.getTaskName() == null ? "" : task.getTaskName()) + " "
+                + (task.getTaskDescription() == null ? "" : task.getTaskDescription())).toLowerCase();
+        if (s.contains("sql注入") || s.contains("sql 注入") || s.contains("sql注入漏洞") || s.contains("sql injection")) return ScanFinding.FindingType.SQL_INJECTION;
+        if (s.contains("文件上传")) return ScanFinding.FindingType.FILE_UPLOAD;
+        if (s.contains("反序列化")) return ScanFinding.FindingType.DESERIALIZATION;
+        if (s.contains("命令")) return ScanFinding.FindingType.COMMAND_INJECTION;
+        if (s.contains("路径穿越") || s.contains("目录穿越")) return ScanFinding.FindingType.PATH_TRAVERSAL;
+        if (s.contains("ssrf")) return ScanFinding.FindingType.SSRF;
+        if (s.contains("xss") || s.contains("跨站脚本")) return ScanFinding.FindingType.XSS;
+        if (s.contains("鉴权") || s.contains("越权") || s.contains("认证") || s.contains("权限")) return ScanFinding.FindingType.AUTH_BYPASS;
+        if (s.contains("csrf") || s.contains("跨站请求")) return ScanFinding.FindingType.CSRF;
+        if (s.contains("重定向")) return ScanFinding.FindingType.OPEN_REDIRECT;
+        if (s.contains("竞态")) return ScanFinding.FindingType.RACE_CONDITION;
+        if (s.contains("依赖") || s.contains("组件") || s.contains("maven") || s.contains("pom")) return ScanFinding.FindingType.INSECURE_DEPENDENCY;
+        return ScanFinding.FindingType.INFORMATION_DISCLOSURE;
+    }
+
+    /**
+     * 批次匹配：任务1（scanRound=1）同时包含历史数据（scanRound 为空）与第一批次
+     */
+    private boolean matchScanRound(Integer taskScanRound, Integer scanRound) {
+        if (scanRound == null) return true;
+        if (scanRound == 1) {
+            return taskScanRound == null || taskScanRound == 1;
+        }
+        return java.util.Objects.equals(taskScanRound, scanRound);
+    }
+
+    private String generateReport(ScanProject project, Integer scanRound) {
         List<ScanFinding> findings = findingRepository.findByProjectIdOrderBySeverityDesc(project.getId());
+        if (scanRound != null) {
+            findings = findings.stream()
+                    .filter(f -> f.getTask() != null && matchScanRound(f.getTask().getScanRound(), scanRound))
+                    .collect(java.util.stream.Collectors.toList());
+        }
 
         StringBuilder report = new StringBuilder();
         report.append("# 代码安全审计报告\n\n");
@@ -3151,6 +3278,7 @@ public class ScanEngineService {
         report.append("## ■ 一、项目信息\n\n");
         report.append("- ◆ 项目名称：").append(project.getProjectName()).append("\n");
         report.append("- ◆ 项目描述：").append(project.getProjectDescription() == null || project.getProjectDescription().isBlank() ? "（无）" : project.getProjectDescription().trim()).append("\n");
+        report.append("- ◆ 扫描批次：").append(scanRound == null ? "全部批次" : "任务" + scanRound).append("\n");
         report.append("- ◆ 扫描完成时间：").append(project.getCompletedAt() == null ? "（项目未全部扫完，报告为已扫描部分的结果）" : project.getCompletedAt()).append("\n");
         report.append("- ◆ 总任务数：").append(project.getTotalTasks()).append("\n");
         report.append("- ◆ 漏洞总数：").append(findings.size()).append("\n\n");
@@ -3178,18 +3306,27 @@ public class ScanEngineService {
             report.append("### 【").append(severityText(finding.getSeverity())).append(" ").append(severityIcon(finding.getSeverity()))
                   .append("】").append(finding.getTitle()).append("\n\n");
             report.append("**漏洞类型**：").append(findingTypeText(finding.getFindingType())).append("\n\n");
-            report.append("**漏洞位置**：").append(finding.getFilePath()).append(" : ").append(finding.getLineNumber()).append("\n\n");
+            if (finding.getFilePath() != null && !finding.getFilePath().isBlank()) {
+                report.append("**漏洞位置**：").append(finding.getFilePath());
+                if (finding.getLineNumber() != null && !finding.getLineNumber().isBlank()) {
+                    report.append(" : ").append(finding.getLineNumber());
+                }
+                report.append("\n\n");
+            }
             if (finding.getCodeSnippet() != null && !finding.getCodeSnippet().isBlank()) {
                 report.append("**问题代码**：\n\n```\n").append(finding.getCodeSnippet().trim()).append("\n```\n\n");
             }
             report.append("**漏洞描述**：").append(finding.getDescription()).append("\n\n");
-            report.append("**利用路径**：").append(finding.getExploitationPath()).append("\n\n");
-            report.append("**修复建议**：").append(finding.getSuggestion()).append("\n\n");
         }
 
         // 任务结论汇总：完成任务显示大模型简要分析结论；
         // 已取消/失败但已产出结论的任务同样展示（部分结论），未完成明细只列实际执行扫描的叶子任务
         List<ScanTask> allTasks = taskRepository.findByProjectId(project.getId());
+        if (scanRound != null) {
+            allTasks = allTasks.stream()
+                    .filter(t -> matchScanRound(t.getScanRound(), scanRound))
+                    .collect(java.util.stream.Collectors.toList());
+        }
         // 叶子任务 = 未作为任何任务父节点的任务（容器类任务不单列展示）
         java.util.Set<Long> parentIds = new java.util.HashSet<>();
         for (ScanTask t : allTasks) {
@@ -3332,11 +3469,11 @@ public class ScanEngineService {
      * 获取报告内容；若尚未生成（如已结束但未生成报告的项目），现场生成并落库
      */
     @Transactional
-    public String getOrGenerateReport(Long projectId) {
+    public String getOrGenerateReport(Long projectId, Integer scanRound) {
         ScanProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new RuntimeException("项目不存在"));
         // 每次预览/导出都基于当前扫描数据实时重新生成（含已取消项目的部分扫描结果），保证内容最新
-        String report = generateReport(project);
+        String report = generateReport(project, scanRound);
         project.setReportContent(report);
         projectRepository.saveAndFlush(project);
         return report;
@@ -3520,39 +3657,178 @@ public class ScanEngineService {
         log.info("异步重启执行任务: taskId={}, taskName={}", taskId, task.getTaskName());
 
         scanExecutor.submit(() -> {
+            // 注册运行时状态，使取消/暂停能作用于重启执行中的任务
+            boolean registered = false;
+            Object execToken = null;
             try {
+                // 先让项目的旧执行线程退出并清除暂停/取消标志：
+                // 否则旧线程会与新线程并发更新 scan_project，触发 InnoDB 死锁
+                waitForPreviousExecutionToStop(finalProjectId);
+
                 // 任务可能在主线程事务提交前还是旧状态，这里 refresh 一下
                 ScanTask freshTask = taskRepository.findById(finalTaskId).orElse(null);
                 if (freshTask == null) {
                     log.warn("重启执行中：任务 {} 已不存在", finalTaskId);
                     return;
                 }
+                // 旧执行线程退出时可能把任务置为 CANCELLED/FAILED，覆盖了重启时的 PENDING，
+                // 这里重新置为 PENDING 并清空子任务，确保重启真正生效
+                if (freshTask.getStatus() == ScanTask.TaskStatus.CANCELLED
+                        || freshTask.getStatus() == ScanTask.TaskStatus.FAILED) {
+                    taskService.resetTaskSubtreeForRestart(finalTaskId);
+                    freshTask = taskRepository.findById(finalTaskId).orElse(null);
+                    if (freshTask == null) {
+                        return;
+                    }
+                }
                 if (freshTask.getStatus() != ScanTask.TaskStatus.PENDING) {
                     log.info("重启执行跳过：任务 {} 状态已变为 {}", finalTaskId, freshTask.getStatus());
                     return;
                 }
 
-                self.executeSingleTask(finalProjectId, freshTask, emitter, finalLlmConfigId, finalProjectCode);
+                registered = taskService.registerTaskIfAbsent(finalProjectId, emitter);
+                execToken = taskService.beginExecution(finalProjectId);
 
-                // 执行完成后，更新项目 findingCount
-                if (freshTask.getStatus() == ScanTask.TaskStatus.COMPLETED) {
-                    ScanProject updatedProject = projectRepository.findById(finalProjectId).orElse(null);
-                    if (updatedProject != null) {
-                        long findings = findingRepository.countByProjectId(finalProjectId);
-                        updatedProject.setFindingCount((int) findings);
-                        projectRepository.saveAndFlush(updatedProject);
+                // 重启期间项目标记为扫描中，保持项目管理处与任务管理处状态一致
+                projectRepository.findById(finalProjectId).ifPresent(p -> {
+                    p.setStatus(ScanProject.ProjectStatus.SCANNING);
+                    p.setCompletedAt(null);
+                    projectRepository.saveAndFlush(p);
+                });
+
+                executeRestartedTaskTree(finalProjectId, freshTask, emitter, finalLlmConfigId, finalProjectCode);
+
+                // 执行完成后重新读取任务状态（执行发生在其独立事务中，内存对象状态已过期）
+                ScanTask executedTask = taskRepository.findById(finalTaskId).orElse(null);
+                ScanTask.TaskStatus finalStatus = executedTask != null
+                        ? executedTask.getStatus() : ScanTask.TaskStatus.FAILED;
+
+                // 同步项目状态与漏洞数量
+                ScanProject updatedProject = projectRepository.findById(finalProjectId).orElse(null);
+                if (updatedProject != null) {
+                    long findings = findingRepository.countByProjectId(finalProjectId);
+                    updatedProject.setFindingCount((int) findings);
+                    if (finalStatus == ScanTask.TaskStatus.CANCELLED || taskService.isCancelled(finalProjectId)) {
+                        updatedProject.setStatus(ScanProject.ProjectStatus.CANCELLED);
+                    } else {
+                        updatedProject.setStatus(ScanProject.ProjectStatus.COMPLETED);
                     }
-                    // 检查父任务是否需要重新汇总
-                    if (freshTask.getParentTask() != null) {
-                        log.info("任务 {} 重启执行完成，父任务 {} 需要重新汇总", finalTaskId, freshTask.getParentTask().getId());
-                    }
+                    updatedProject.setCompletedAt(LocalDateTime.now());
+                    projectRepository.saveAndFlush(updatedProject);
                 }
 
-                log.info("异步重启执行完成: taskId={}, taskName={}, status={}", 
-                        finalTaskId, freshTask.getTaskName(), freshTask.getStatus());
+                // 检查父任务是否需要重新汇总
+                if (executedTask != null && executedTask.getParentTaskId() != null) {
+                    log.info("任务 {} 重启执行完成，父任务 {} 需要重新汇总",
+                            finalTaskId, executedTask.getParentTaskId());
+                }
+
+                log.info("异步重启执行完成: taskId={}, taskName={}, status={}",
+                        finalTaskId, freshTask.getTaskName(), finalStatus);
             } catch (Exception e) {
                 log.error("异步重启执行异常: taskId={}", finalTaskId, e);
+            } finally {
+                if (execToken != null) {
+                    taskService.endExecution(execToken);
+                }
+                if (registered) {
+                    taskService.unregisterTask(finalProjectId);
+                }
             }
         });
+    }
+
+    /**
+     * 重启前等待项目的旧执行线程退出：
+     * 先请求中止（唤醒暂停中的线程），再轮询等待其结束，最后清除暂停/取消标志。
+     * 目的：避免新旧两个执行线程并发更新 scan_project 造成 InnoDB 死锁。
+     * 最多等待 30 秒；若旧线程仍在长时间的大模型调用中未退出，则记录告警后继续执行。
+     */
+    private void waitForPreviousExecutionToStop(Long projectId) {
+        if (taskService.getActiveExecutions(projectId) > 0) {
+            taskService.requestAbort(projectId);
+        }
+        for (int i = 0; i < 60; i++) {
+            if (taskService.getActiveExecutions(projectId) == 0) {
+                break;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        int remaining = taskService.getActiveExecutions(projectId);
+        if (remaining > 0) {
+            log.warn("重启时旧执行线程仍未退出，可能存在并发: projectId={}, 剩余执行线程={}", projectId, remaining);
+        } else {
+            log.info("重启前旧执行已退出: projectId={}", projectId);
+        }
+        taskService.clearPauseCancelFlags(projectId);
+    }
+
+    /**
+     * 重启后按任务类型重新调度执行。
+     * 阶段任务（依赖扫描/接口扫描/高危操作扫描）与接口子任务本身不执行 LLM，
+     * 只作为容器承载子/孙任务；若直接对容器任务调用 executeSingleTask，
+     * 会出现"容器任务已完成、子任务与孙任务一直停留在等待扫描"的问题。
+     */
+    private void executeRestartedTaskTree(Long projectId, ScanTask task, SseEmitter emitter,
+                                          Long llmConfigId, String projectCode) {
+        ScanTask.TaskType type = task.getTaskType();
+        Integer scanRound = task.getScanRound();
+
+        // 容器任务先置为运行中，避免子/孙任务执行期间界面仍显示"等待扫描"
+        boolean isContainer = type == ScanTask.TaskType.DEPENDENCY_SCAN
+                || type == ScanTask.TaskType.INTERFACE_SCAN
+                || type == ScanTask.TaskType.HIGH_RISK_OPERATION_SCAN
+                || type == ScanTask.TaskType.SUB_INTERFACE_SCAN;
+        if (isContainer) {
+            task.setStatus(ScanTask.TaskStatus.RUNNING);
+            task.setStartedAt(LocalDateTime.now());
+            taskRepository.saveAndFlush(task);
+        }
+
+        switch (type) {
+            case DEPENDENCY_SCAN ->
+                    self.executeTasksByType(projectId, emitter, llmConfigId, projectCode,
+                            List.of(ScanTask.TaskType.SUB_DEPENDENCY_SCAN), scanRound);
+            case INTERFACE_SCAN -> {
+                // 中间的接口子任务也是容器，先置运行中，避免其子任务执行期间仍显示"等待扫描"
+                updatePhaseTaskStatus(projectId, ScanTask.TaskType.SUB_INTERFACE_SCAN,
+                        ScanTask.TaskStatus.RUNNING, scanRound);
+                self.executeTasksByType(projectId, emitter, llmConfigId, projectCode,
+                        List.of(ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN), scanRound);
+                aggregateInterfaceSubTasks(projectId, scanRound);
+            }
+            case HIGH_RISK_OPERATION_SCAN ->
+                    self.executeHighRiskGrandchildTasks(projectId, emitter, llmConfigId, projectCode, scanRound);
+            case SUB_INTERFACE_SCAN -> {
+                self.executeTasksByType(projectId, emitter, llmConfigId, projectCode,
+                        List.of(ScanTask.TaskType.SUB_INTERFACE_VULNERABILITY_SCAN), scanRound);
+                aggregateInterfaceSubTasks(projectId, scanRound);
+            }
+            default -> {
+                // 叶子任务：直接执行
+                self.executeSingleTask(projectId, task, emitter, llmConfigId, projectCode);
+                return;
+            }
+        }
+
+        // 容器任务：子/孙任务执行完成后同步容器状态
+        ScanTask container = taskRepository.findById(task.getId()).orElse(null);
+        if (container == null) {
+            return;
+        }
+        boolean cancelled = taskService.isCancelled(projectId);
+        container.setStatus(cancelled ? ScanTask.TaskStatus.CANCELLED : ScanTask.TaskStatus.COMPLETED);
+        if (!cancelled) {
+            container.setProgress(100);
+        }
+        container.setCompletedAt(LocalDateTime.now());
+        taskRepository.saveAndFlush(container);
+        log.info("重启容器任务完成: taskId={}, taskName={}, status={}",
+                container.getId(), container.getTaskName(), container.getStatus());
     }
 }

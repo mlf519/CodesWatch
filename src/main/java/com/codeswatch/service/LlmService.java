@@ -38,10 +38,14 @@ public class LlmService {
     private final PromptConfigService promptConfigService;
 
     private static final int CONNECT_TIMEOUT = 10000;
-    private static final int SOCKET_TIMEOUT = 300000;
+    // 等待大模型回复时间整体延长为原来的 3 倍（原 300000），
+    // 避免大模型响应较慢时被底层 HTTP 读超时提前中断
+    private static final int SOCKET_TIMEOUT = 900000;
     private static final int MAX_CODE_LENGTH = 500000;
-    private static final int ANALYSIS_TIMEOUT = 60000;
-    private static final int THINKING_ANALYSIS_TIMEOUT = 120000;
+    // 原 60000，延长为 3 倍
+    private static final int ANALYSIS_TIMEOUT = 180000;
+    // 原 120000，延长为 3 倍
+    private static final int THINKING_ANALYSIS_TIMEOUT = 360000;
 
     private CloseableHttpClient createHttpClient() {
         RequestConfig requestConfig = RequestConfig.custom()

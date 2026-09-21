@@ -311,11 +311,19 @@
                             </div>
 
                             <div id="tasks-tab" class="tab-pane hidden">
+                                <div class="filter-bar" id="task-batch-bar" style="display:none;">
+                                    <label for="task-batch-select">扫描任务：</label>
+                                    <select id="task-batch-select"></select>
+                                </div>
                                 <div id="task-tree"></div>
                             </div>
 
                             <div id="findings-tab" class="tab-pane hidden">
                                 <div class="filter-bar">
+                                    <span id="finding-batch-bar" style="display:none;">
+                                        <label for="finding-batch-select">扫描任务：</label>
+                                        <select id="finding-batch-select"></select>
+                                    </span>
                                     <select id="severity-filter">
                                         <option value="all">全部级别</option>
                                         <option value="CRITICAL">严重</option>
@@ -342,6 +350,12 @@
                             </div>
 
                             <div id="report-tab" class="tab-pane hidden">
+                                <div class="filter-bar">
+                                    <span id="report-batch-bar" style="display:none;">
+                                        <label for="report-batch-select">扫描任务：</label>
+                                        <select id="report-batch-select"></select>
+                                    </span>
+                                </div>
                                 <div class="report-content" id="report-content"></div>
                                 <div class="info-actions" style="margin-top: 12px;">
                                     <button id="export-report-btn" class="btn btn-secondary">

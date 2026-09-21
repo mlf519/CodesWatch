@@ -472,6 +472,7 @@ async function loadProjectDetail(id) {
     const response = await fetch(`${API_BASE}/projects/${id}`);
     if (response.ok) {
         const project = await response.json();
+        currentProjectData = project;
         
         document.getElementById('project-detail-title').textContent = project.projectName;
         document.getElementById('detail-name').textContent = project.projectName;
@@ -505,15 +506,98 @@ async function loadProjectDetail(id) {
             cancelBtn.style.display = 'none';
         }
         
-        renderTaskTree(project.tasks);
+        // 初始化扫描任务批次选择器（多个扫描批次时可选）
+        initBatchSelectors(project);
+        renderTaskTree(getCurrentBatchTasks());
         initProjectDetailTaskTree();
-        renderFindings(project.findings);
+        renderFindings(getCurrentBatchFindings());
 
         loadLogs(id);
         currentDetailScanning = project.status === 'SCANNING';
         loadProjectReport(id);
         startReportAutoRefresh(id);
     }
+}
+
+// ==================== 项目详情：扫描任务批次选择 ====================
+let currentProjectData = null;
+
+/** 任务/漏洞的批次号：历史数据（scanRound 为空）视为任务1 */
+function getBatchRound(item) {
+    return item && item.scanRound != null ? item.scanRound : 1;
+}
+
+/** 从根任务列表提取去重排序后的批次号列表 */
+function buildBatchOptions(tasks) {
+    const set = new Set();
+    (tasks || []).forEach(t => set.add(getBatchRound(t)));
+    return Array.from(set).sort((a, b) => a - b);
+}
+
+function getBatchBarId(selectId) {
+    if (selectId === 'task-batch-select') return 'task-batch-bar';
+    if (selectId === 'finding-batch-select') return 'finding-batch-bar';
+    return 'report-batch-bar';
+}
+
+/** 填充批次下拉；仅多批次时显示 */
+function populateBatchSelect(selectId, batches) {
+    const bar = document.getElementById(getBatchBarId(selectId));
+    const select = document.getElementById(selectId);
+    if (batches.length <= 1) {
+        if (bar) bar.style.display = 'none';
+        if (select) select.innerHTML = '';
+        return;
+    }
+    if (bar) bar.style.display = 'inline-flex';
+    select.innerHTML = batches.map(r => `<option value="${r}">任务${r}</option>`).join('');
+    // 默认选中最新批次
+    select.value = String(batches[batches.length - 1]);
+}
+
+function getSelectedBatch(selectId) {
+    const select = document.getElementById(selectId);
+    if (!select) return null;
+    const v = select.value;
+    return (v === '' || v == null) ? null : parseInt(v, 10);
+}
+
+function initBatchSelectors(project) {
+    const batches = buildBatchOptions(project.tasks);
+    populateBatchSelect('task-batch-select', batches);
+    populateBatchSelect('finding-batch-select', batches);
+    populateBatchSelect('report-batch-select', batches);
+
+    document.getElementById('task-batch-select').onchange = () => {
+        renderTaskTree(getCurrentBatchTasks());
+        initProjectDetailTaskTree();
+    };
+    document.getElementById('finding-batch-select').onchange = () => {
+        renderFindings(getCurrentBatchFindings());
+    };
+    document.getElementById('report-batch-select').onchange = () => {
+        if (currentProjectId) loadProjectReport(currentProjectId, false);
+    };
+}
+
+/** 当前选中批次的根任务列表 */
+function getCurrentBatchTasks() {
+    if (!currentProjectData) return [];
+    const round = getSelectedBatch('task-batch-select');
+    const tasks = currentProjectData.tasks || [];
+    if (round == null) return tasks;
+    return tasks.filter(t => getBatchRound(t) === round);
+}
+
+/** 当前选中批次 + 严重级别过滤后的漏洞列表 */
+function getCurrentBatchFindings() {
+    if (!currentProjectData) return [];
+    const round = getSelectedBatch('finding-batch-select');
+    let list = currentProjectData.findings || [];
+    if (round != null) list = list.filter(f => getBatchRound(f) === round);
+    const severity = document.getElementById('severity-filter').value;
+    if (severity !== 'all') list = list.filter(f => f.severity === severity);
+    return list;
 }
 
 function renderTaskTree(tasks) {
@@ -921,13 +1005,7 @@ function initProjectDetail() {
     });
     
     document.getElementById('severity-filter').addEventListener('change', async (e) => {
-        const severity = e.target.value;
-        const response = await fetch(`${API_BASE}/projects/${currentProjectId}/findings`);
-        if (response.ok) {
-            const findings = await response.json();
-            const filtered = severity === 'all' ? findings : findings.filter(f => f.severity === severity);
-            renderFilteredFindings(filtered);
-        }
+        renderFindings(getCurrentBatchFindings());
     });
 }
 
@@ -1324,7 +1402,10 @@ async function deleteProject(id) {
 }
 
 async function exportReport(projectId, format = 'md') {
-    const response = await fetch(`${API_BASE}/projects/${projectId}/report/export?format=${format}`);
+    const scanRound = getSelectedBatch('report-batch-select');
+    let apiUrl = `${API_BASE}/projects/${projectId}/report/export?format=${format}`;
+    if (scanRound != null) apiUrl += `&scanRound=${scanRound}`;
+    const response = await fetch(apiUrl);
     if (!response.ok) {
         let msg = '导出失败';
         try {
@@ -1353,14 +1434,18 @@ let reportAutoRefreshTimer = null;
 let currentDetailScanning = false;
 let pendingFinalReportRefresh = false;
 
-async function loadProjectReport(projectId, silent = false) {
+async function loadProjectReport(projectId, silent = false, scanRound) {
     const container = document.getElementById('report-content');
     if (!silent) {
         container.innerHTML = '<p style="text-align:center; color:#00aa29; padding:20px;">报告加载中...</p>';
         lastReportContent = '';
     }
     try {
-        const response = await fetch(`${API_BASE}/projects/${projectId}/report`);
+        let url = `${API_BASE}/projects/${projectId}/report`;
+        // scanRound 为空时取当前选中批次（未选择则全部）
+        if (scanRound == null) scanRound = getSelectedBatch('report-batch-select');
+        if (scanRound != null) url += `?scanRound=${scanRound}`;
+        const response = await fetch(url);
         if (!response.ok) throw new Error('加载失败');
         const data = await response.json();
         const report = (data.reportContent || '').trim();
@@ -2544,72 +2629,32 @@ function startTaskStream(taskId) {
 }
 
 async function pauseTask(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/pause`, { method: 'POST' });
-    if (response.ok) {
-        showToast('任务已暂停');
-        loadTasks(currentTaskFilter);
-    }
+    await runTaskAction('暂停中...', '任务已暂停', `${API_BASE}/tasks/${taskId}/pause`, '暂停失败');
 }
 
 async function pauseTaskWithChildren(taskId) {
     if (!confirm('确定要暂停此任务及其所有子任务吗？')) return;
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/pause-children`, { method: 'POST' });
-    if (response.ok) {
-        showToast('任务及其子任务已暂停');
-        loadTasks(currentTaskFilter);
-    } else {
-        const err = await response.json().catch(() => ({}));
-        alert('暂停失败: ' + (err.message || '未知错误'));
-    }
+    await runTaskAction('暂停中...', '任务及其子任务已暂停', `${API_BASE}/tasks/${taskId}/pause-children`, '暂停失败');
 }
 
 async function resumeTaskWithChildren(taskId) {
     if (!confirm('确定要继续此任务及其所有子任务吗？')) return;
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/resume-children`, { method: 'POST' });
-    if (response.ok) {
-        showToast('任务及其子任务已恢复');
-        loadTasks(currentTaskFilter);
-    } else {
-        const err = await response.json().catch(() => ({}));
-        alert('继续失败: ' + (err.message || '未知错误'));
-    }
+    await runTaskAction('继续中...', '任务及其子任务已恢复', `${API_BASE}/tasks/${taskId}/resume-children`, '继续失败');
 }
 
 async function restartTask(taskId) {
     if (!confirm('确定要重启此任务吗？\n\n将重置任务状态并清除执行结果，子任务也会一并重置。')) return;
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/restart`, { method: 'POST' });
-    if (response.ok) {
-        showToast('任务已重启，状态已重置');
-        loadTasks(currentTaskFilter);
-    } else {
-        const err = await response.json().catch(() => ({}));
-        alert('重启失败: ' + (err.message || '未知错误'));
-    }
+    await runTaskAction('重启中...', '任务已重启，状态已重置', `${API_BASE}/tasks/${taskId}/restart`, '重启失败');
 }
 
 async function cancelTask(taskId) {
     if (!confirm('确定要取消此任务吗？\n\n其所有子任务和孙任务也会一并取消！')) return;
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/cancel`, { method: 'POST' });
-    if (response.ok) {
-        showToast('任务已取消');
-        loadTasks(currentTaskFilter);
-    }
+    await runTaskAction('取消中...', '任务已取消', `${API_BASE}/tasks/${taskId}/cancel`, '取消失败');
 }
 
 async function deleteTask(taskId) {
     if (!confirm('确定要删除此任务吗？\n\n注意：删除父任务将同时删除其所有子任务和孙任务，此操作不可恢复！')) return;
-    try {
-        const response = await fetch(`${API_BASE}/tasks/${taskId}`, { method: 'DELETE' });
-        if (response.ok) {
-            showToast('任务及所有子任务已删除');
-            loadTasks(currentTaskFilter);
-        } else {
-            const err = await response.json().catch(() => ({}));
-            alert('删除失败: ' + (err.message || '未知错误'));
-        }
-    } catch (err) {
-        alert('删除失败: ' + err.message);
-    }
+    await runTaskAction('删除中...', '任务及所有子任务已删除', `${API_BASE}/tasks/${taskId}`, '删除失败', 'DELETE');
 }
 
 async function testLlmConnection(id, btn) {
@@ -2823,6 +2868,70 @@ function showToast(message) {
         toast.style.animation = 'slideOut 0.3s ease';
         setTimeout(() => toast.remove(), 300);
     }, 3000);
+}
+
+/**
+ * 右上角常驻"操作中"提示（取消中/暂停中/重启中...），
+ * 请求结束后需调用返回句柄的 close() 关闭。
+ * 用于取消/暂停/重启等耗时操作期间给用户明确反馈。
+ */
+function showPendingToast(message) {
+    const toast = document.createElement('div');
+    toast.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: rgba(0, 20, 0, 0.95);
+        border: 1px solid #00ff41;
+        color: #00ff41;
+        padding: 12px 24px;
+        border-radius: 4px;
+        box-shadow: 0 0 20px rgba(0, 255, 65, 0.4);
+        z-index: 10000;
+        animation: slideIn 0.3s ease;
+        font-family: 'Courier New', monospace;
+        text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    `;
+    const spinner = document.createElement('i');
+    spinner.className = 'fas fa-spinner fa-spin';
+    const text = document.createElement('span');
+    text.textContent = message;
+    toast.appendChild(spinner);
+    toast.appendChild(text);
+    document.body.appendChild(toast);
+
+    return {
+        close() {
+            if (!toast.parentNode) return;
+            toast.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => toast.remove(), 300);
+        }
+    };
+}
+
+/**
+ * 统一执行任务操作（取消/暂停/继续/重启/删除）：
+ * 请求期间在右上角常驻"操作中"提示，结束后提示结果并刷新列表。
+ */
+async function runTaskAction(pendingMessage, successMessage, url, failPrefix, method = 'POST') {
+    const pending = showPendingToast(pendingMessage);
+    try {
+        const response = await fetch(url, { method });
+        if (response.ok) {
+            showToast(successMessage);
+        } else {
+            const err = await response.json().catch(() => ({}));
+            showToast(`${failPrefix}: ${err.error || err.message || '未知错误'}`);
+        }
+    } catch (err) {
+        showToast(`${failPrefix}: ${err.message}`);
+    } finally {
+        pending.close();
+        loadTasks(currentTaskFilter);
+    }
 }
 
 // ==================== 提示词配置功能 ====================

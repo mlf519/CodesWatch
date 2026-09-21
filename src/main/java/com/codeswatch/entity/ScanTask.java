@@ -23,8 +23,12 @@ public class ScanTask {
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "project_id", nullable = false)
+    @JoinColumn(name = "project_id")
     private ScanProject project;
+
+    /** 扫描批次号（同一项目多次扫描时区分批次，任务2/3等） */
+    @Column(name = "scan_round")
+    private Integer scanRound;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "parent_id")
